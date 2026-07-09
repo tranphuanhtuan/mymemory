@@ -1,0 +1,197 @@
+name: Sync Images from Issue to Code
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to sync images from'
+        required: true
+        type: number
+
+jobs:
+  sync-images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Get Issue Details
+        id: issue_details
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ inputs.issue_number }}
+            });
+            
+            // Get labels from issue
+            const labels = issue.data.labels.map(l => l.name);
+            console.log('Labels:', labels);
+            
+            // Get issue body and comments for image URLs
+            let imageUrls = [];
+            
+            // Extract image URLs from issue body
+            const bodyRegex = /!\[.*?\]\((https:\/\/[^\)]+)\)/g;
+            let match;
+            while ((match = bodyRegex.exec(issue.data.body)) !== null) {
+              imageUrls.push(match[1]);
+            }
+            
+            // Get comments with images
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ inputs.issue_number }}
+            });
+            
+            for (const comment of comments.data) {
+              const commentRegex = /!\[.*?\]\((https:\/\/[^\)]+)\)/g;
+              while ((match = commentRegex.exec(comment.body)) !== null) {
+                imageUrls.push(match[1]);
+              }
+            }
+            
+            core.setOutput('labels', JSON.stringify(labels));
+            core.setOutput('image_urls', JSON.stringify(imageUrls));
+            core.setOutput('issue_title', issue.data.title);
+
+      - name: Download and Process Images
+        id: process_images
+        run: |
+          python3 << 'EOF'
+          import os
+          import json
+          import urllib.request
+          from pathlib import Path
+          
+          # Label to folder mapping based on your website structure
+          label_to_folder = {
+              "Nghiên cứu khoa học": "Ban Than/Nghien cuu",
+              "Mentoring": "Ban Than/Mentoring",
+              "Sở thích": "Ban Than/So thich",
+              "Bảo tàng": "Ban Than/Bao tang HCM",
+              "Đám cưới anh Trường": "Gia Dinh/Dam Cuoi Anh Truong",
+              "Chị Hai": "Gia Dinh/Chi Hai",
+              "Chú Linh": "Gia Dinh/Chu Linh",
+              "Mẹ": "Gia Dinh/Me",
+              "Nha Trang": "Gia Dinh/Nha Trang",
+              "Vũng Tàu": "Gia Dinh/Vung Tau",
+              "Ngoại": "Gia Dinh/Ngoai",
+              "Cấp 3": "Ban Be/Cap 3",
+              "Sinh viên": "Ban Be/Sinh vien",
+              "Tòa án": "Ban Be/Toa An",
+              "Bạn nước ngoài": "Ban Be/Ban nuoc ngoai",
+              "Đà Lạt": "Ban Be/Da Lat",
+              "HRLZ": "Ban Be/HRLZ",
+              "Mùa hè xanh": "Ban Be/Mua he xanh",
+              "Quân sự": "Ban Be/Quan su",
+              "Vinamilk": "Ban Be/Vinamilk"
+          }
+          
+          labels = json.loads('${{ steps.issue_details.outputs.labels }}')
+          image_urls = json.loads('${{ steps.issue_details.outputs.image_urls }}')
+          
+          # Find matching folder from labels
+          target_folder = None
+          for label in labels:
+              if label in label_to_folder:
+                  target_folder = label_to_folder[label]
+                  break
+          
+          if not target_folder:
+              print("❌ No matching label found. Using default: Ban Than/Nghien cuu")
+              target_folder = "Ban Than/Nghien cuu"
+          
+          print(f"📁 Target folder: {target_folder}")
+          
+          # Create folder if it doesn't exist
+          Path(target_folder).mkdir(parents=True, exist_ok=True)
+          
+          # Download images
+          downloaded_files = []
+          for idx, url in enumerate(image_urls, 1):
+              try:
+                  # Extract filename from URL
+                  filename = url.split('/')[-1].split('?')[0]
+                  if not filename or '.' not in filename:
+                      ext = '.jpg'  # default extension
+                      filename = f'image_{idx}{ext}'
+                  
+                  filepath = os.path.join(target_folder, filename)
+                  print(f"⬇️  Downloading image {idx}/{len(image_urls)}: {filename}")
+                  
+                  urllib.request.urlretrieve(url, filepath)
+                  downloaded_files.append(filepath)
+                  print(f"✅ Saved: {filepath}")
+              except Exception as e:
+                  print(f"⚠️  Error downloading {url}: {e}")
+          
+          # Output results
+          with open('downloaded_files.txt', 'w', encoding='utf-8') as f:
+              for file in downloaded_files:
+                  f.write(file + '\n')
+          
+          print(f"\n✨ Successfully downloaded {len(downloaded_files)} images!")
+          
+          EOF
+
+      - name: Commit and Push Images
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Add all new images
+          git add "Ban Than/" "Gia Dinh/" "Ban Be/" || true
+          
+          # Check if there are changes to commit
+          if git diff --cached --quiet; then
+            echo "❌ No new files to commit"
+          else
+            git commit -m "🖼️ Auto-sync images from issue #${{ inputs.issue_number }}: ${{ steps.issue_details.outputs.issue_title }}"
+            git push origin main
+            echo "✅ Images committed and pushed to main!"
+          fi
+
+      - name: Update Issue Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const downloadedFiles = fs.existsSync('downloaded_files.txt') 
+              ? fs.readFileSync('downloaded_files.txt', 'utf-8').trim().split('\n')
+              : [];
+            
+            let comment = `## ✅ Image Sync Complete!\n\n`;
+            comment += `**Images Downloaded:** ${downloadedFiles.length}\n\n`;
+            
+            if (downloadedFiles.length > 0) {
+              comment += `**Files added to code:**\n`;
+              downloadedFiles.forEach(file => {
+                comment += `- \`${file}\`\n`;
+              });
+            } else {
+              comment += `❌ No images found in this issue\n`;
+            }
+            
+            comment += `\n**Label Detected:** ${{ steps.issue_details.outputs.labels }}\n`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ inputs.issue_number }},
+              body: comment
+            });
